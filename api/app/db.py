@@ -5,9 +5,20 @@ from . import config
 
 
 def primary(row_factory=None):
-    """Connection to the always-on source database."""
+    """Connection to the always-on source database (autocommit)."""
     return psycopg.connect(
         config.PRIMARY_DSN, autocommit=True, connect_timeout=5, row_factory=row_factory
+    )
+
+
+def primary_transaction(row_factory=None):
+    """Connection whose ``with`` block is one transaction.
+
+    Used for ingestion: observation inserts, primary-table writes and the
+    watermark advance must commit or roll back together.
+    """
+    return psycopg.connect(
+        config.PRIMARY_DSN, autocommit=False, connect_timeout=5, row_factory=row_factory
     )
 
 

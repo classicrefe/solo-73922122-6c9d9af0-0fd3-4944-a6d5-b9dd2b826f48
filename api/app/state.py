@@ -1,8 +1,9 @@
 """Tiny SQLite-backed state store for restore points and recovery jobs.
 
-Kept outside the source database on purpose: the source DB holds exactly one
-business table, and API bookkeeping must not pollute it (or the replicas,
-which are physical copies of the source cluster).
+Kept outside the source database on purpose: API bookkeeping must not pollute
+the source DB (or the replicas, which are physical copies of the source
+cluster).  Business data (minute counts and the ingest ledger) lives in the
+source DB; only operational metadata lives here.
 """
 
 import sqlite3

@@ -41,3 +41,7 @@ BACKUP_ON_STARTUP = os.environ.get("BACKUP_ON_STARTUP", "1")
 REPLICA_RUN_AS = os.environ.get("REPLICA_RUN_AS", "postgres")
 
 TRAFFIC_TABLE = "traffic_minute_counts"
+
+# How long an ingest batch waits for another batch of the same intersection
+# before giving up (nothing is written; the collector may retry).
+INGEST_LOCK_TIMEOUT_MS = int(os.environ.get("INGEST_LOCK_TIMEOUT_MS", "15000"))

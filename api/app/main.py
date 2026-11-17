@@ -16,13 +16,15 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
+import psycopg
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
-from . import backup, config, db, lsn, recovery, state
+from . import backup, config, db, ingest, lsn, recovery, state
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -50,6 +52,21 @@ def _monitor_loop():
         time.sleep(3)
 
 
+def _ensure_ingest_schema_loop():
+    """Create the ingest ledger once the primary is reachable.
+
+    The tables also exist in db/init, but a data volume created by an older
+    version of the stack is upgraded in place here.
+    """
+    while True:
+        try:
+            ingest.ensure_schema()
+            return
+        except Exception:
+            log.warning("ingest ledger schema not ready yet, retrying")
+        time.sleep(2)
+
+
 @asynccontextmanager
 async def lifespan(_app):
     os.makedirs(config.RECOVERY_ROOT, exist_ok=True)
@@ -60,16 +77,26 @@ async def lifespan(_app):
     threading.Thread(target=backup.run_base_backup, daemon=True, name="base-backup").start()
     threading.Thread(target=_readiness_loop, daemon=True, name="readiness").start()
     threading.Thread(target=_monitor_loop, daemon=True, name="monitor").start()
+    threading.Thread(
+        target=_ensure_ingest_schema_loop, daemon=True, name="ingest-schema"
+    ).start()
     yield
 
 
 app = FastAPI(
     title="Traffic PITR Recovery API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Physical point-in-time recovery for the traffic_minute_counts table. "
-        "Flow: 1) POST /demo/generate to simulate collection, "
-        "2) POST /restore-points to create a named restore point, "
+        "Ordered batch ingestion for out-of-order collector retransmissions, "
+        "plus physical point-in-time recovery for the traffic_minute_counts "
+        "table. Ingest flow: POST /ingest/batches with records "
+        "{intersection_id, seq, minute_utc, vehicle_count}; seq starts at 1. "
+        "Records beyond a gap stay pending (GET /ingest/pending/{id}); once "
+        "the gap is filled the contiguous run is published in sequence order, "
+        "so a higher seq for the same minute overrides the earlier value. "
+        "GET /ingest/watermarks gives the published watermark and "
+        "next_missing_seq. Recovery flow: 1) POST /demo/generate to simulate "
+        "collection, 2) POST /restore-points to create a named restore point, "
         "3) POST /demo/delete to simulate the accidental deletion, "
         "4) POST /recoveries to rebuild an isolated read-only replica at the "
         "restore point, 5) GET /replica/traffic to fetch the lost rows. "
@@ -108,6 +135,186 @@ def backup_status():
         "completed_at": state.kv_get("backup_completed_at"),
         "error": state.kv_get("backup_error") or None,
         "backup_dir": config.BACKUP_DIR,
+    }
+
+
+# --------------------------------------------------------------------------
+# batch ingestion (out-of-order collector retransmissions)
+# --------------------------------------------------------------------------
+
+class IngestRecord(BaseModel):
+    intersection_id: str = Field(..., min_length=1, max_length=128)
+    seq: int = Field(
+        ..., ge=1, le=9_223_372_036_854_775_807, description="1-based sequence number"
+    )
+    minute_utc: datetime = Field(..., description="UTC minute (whole minute)")
+    vehicle_count: int = Field(..., ge=0, le=2_147_483_647)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "intersection_id": "IX-001",
+                "seq": 1,
+                "minute_utc": "2026-11-17T08:00:00Z",
+                "vehicle_count": 12,
+            }
+        }
+    }
+
+
+class IngestBatch(BaseModel):
+    records: list[IngestRecord] = Field(..., min_length=1, max_length=10000)
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "records": [
+                    {
+                        "intersection_id": "IX-001",
+                        "seq": 1,
+                        "minute_utc": "2026-11-17T08:00:00Z",
+                        "vehicle_count": 12,
+                    },
+                    {
+                        "intersection_id": "IX-001",
+                        "seq": 3,
+                        "minute_utc": "2026-11-17T08:02:00Z",
+                        "vehicle_count": 21,
+                    },
+                ]
+            }
+        }
+    }
+
+
+def _ingest_ready():
+    try:
+        ingest.ensure_schema()
+    except Exception as exc:  # noqa: BLE001 - surfaced as 503
+        raise HTTPException(503, f"ingest ledger is not available: {exc}") from exc
+
+
+@app.post("/ingest/batches", tags=["ingest"])
+def ingest_batch(batch: IngestBatch):
+    """Accept one collector retransmission batch (idempotent, atomic).
+
+    * records above a gap are persisted and stay ``pending``;
+    * filling a gap publishes the contiguous run in ascending ``seq`` order,
+      so for the same minute the higher seq overrides the earlier value;
+    * re-sending the same ``(intersection_id, seq)`` with the same content is
+      a no-op (``already_stored``); different content rejects the whole batch
+      with 409 and nothing is written;
+    * observation storage, primary-table writes and the watermark advance
+      share one transaction.
+    """
+    _ingest_ready()
+    try:
+        return ingest.submit_batch(
+            [
+                ingest.IncomingRecord(
+                    intersection_id=record.intersection_id,
+                    seq=record.seq,
+                    minute_utc=record.minute_utc,
+                    vehicle_count=record.vehicle_count,
+                )
+                for record in batch.records
+            ]
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ingest.ContentConflict as exc:
+        raise HTTPException(
+            409,
+            {
+                "error": "content conflict",
+                "message": (
+                    "one or more sequence numbers were already stored with "
+                    "different content; the whole batch was rejected"
+                ),
+                "conflicts": exc.conflicts,
+            },
+        ) from exc
+    except psycopg.errors.LockNotAvailable as exc:
+        # Another batch for the same intersection holds its lock.  Nothing
+        # was written; the collector should retry the same batch.
+        raise HTTPException(
+            503,
+            "another batch for the same intersection is still being applied; "
+            "nothing was written, retry the batch",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - storage failure, nothing committed
+        log.exception("ingest batch failed")
+        raise HTTPException(503, f"ingest batch failed: {exc}") from exc
+
+
+@app.get("/ingest/watermarks", tags=["ingest"])
+def ingest_watermarks():
+    """Published watermark and next missing seq per intersection."""
+    _ingest_ready()
+    return {"items": ingest.list_watermarks()}
+
+
+@app.get("/ingest/watermarks/{intersection_id}", tags=["ingest"])
+def ingest_watermark(intersection_id: str):
+    """One intersection: published watermark and next missing seq."""
+    _ingest_ready()
+    result = ingest.get_watermark(intersection_id)
+    if result is None:
+        raise HTTPException(404, f"no ingestion seen for {intersection_id!r}")
+    return result
+
+
+@app.get("/ingest/pending/{intersection_id}", tags=["ingest"])
+def ingest_pending(
+    intersection_id: str,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """Persisted-but-not-yet-publishable observations for one intersection."""
+    _ingest_ready()
+    result = ingest.list_pending(intersection_id, limit, offset)
+    if result is None:
+        raise HTTPException(404, f"no ingestion seen for {intersection_id!r}")
+    return result
+
+
+@app.get("/ingest/observations/{intersection_id}", tags=["ingest"])
+def ingest_observations(
+    intersection_id: str,
+    status: str = Query("all", pattern="^(all|pending|published)$"),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """Stored observations with their published/pending status."""
+    _ingest_ready()
+    result = ingest.list_observations(intersection_id, status, limit, offset)
+    if result is None:
+        raise HTTPException(404, f"no ingestion seen for {intersection_id!r}")
+    return result
+
+
+@app.get("/ingest/traffic/{intersection_id}", tags=["ingest"])
+def ingest_traffic(intersection_id: str):
+    """Current primary-table rows for one intersection (published data)."""
+    _ingest_ready()
+    with db.primary(row_factory=dict_row) as conn:
+        conn.execute("SET TIME ZONE 'UTC'")
+        rows = conn.execute(
+            f"SELECT intersection_id, minute_utc, vehicle_count "
+            f"FROM {config.TRAFFIC_TABLE} WHERE intersection_id = %s "
+            f"ORDER BY minute_utc",
+            (intersection_id,),
+        ).fetchall()
+    return {
+        "intersection_id": intersection_id,
+        "rows": [
+            {
+                "intersection_id": row["intersection_id"],
+                "minute_utc": row["minute_utc"].isoformat().replace("+00:00", "Z"),
+                "vehicle_count": row["vehicle_count"],
+            }
+            for row in rows
+        ],
     }
 
 
